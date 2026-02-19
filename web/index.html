@@ -7,13 +7,19 @@
     <style>
       body { font-family: system-ui, sans-serif; margin: 2rem; }
       .row { display: flex; gap: .5rem; margin-bottom: .75rem; flex-wrap: wrap; }
-      input, button { padding: .5rem .75rem; }
+      input, button, select { padding: .5rem .75rem; }
       pre { background: #111; color: #0f0; padding: 1rem; min-height: 260px; overflow: auto; }
+      small { color: #666; }
     </style>
   </head>
   <body>
     <h1>lamyclaw</h1>
     <p>OpenCode Docker 컨테이너 관리</p>
+
+    <div class="row">
+      <input id="token" placeholder="API 토큰(선택)" />
+      <small>LAMYCLAW_API_TOKEN 설정 시 입력</small>
+    </div>
 
     <div class="row">
       <input id="name" placeholder="컨테이너 이름" value="opencode-1" />
@@ -24,19 +30,67 @@
       <button id="refresh">목록 새로고침</button>
     </div>
 
+    <div class="row">
+      <select id="containerSelect"></select>
+      <button id="start">시작</button>
+      <button id="stop">중지</button>
+      <button id="restart">재시작</button>
+      <button id="remove">삭제</button>
+      <button id="logs">로그 보기</button>
+    </div>
+
     <pre id="output">loading...</pre>
 
     <script>
       const output = document.getElementById('output');
-      const refresh = async () => {
-        const [cRes, pRes, hRes] = await Promise.all([
-          fetch('/api/containers'),
-          fetch('/api/ports'),
-          fetch('/api/health')
-        ]);
-        const [containers, ports, health] = await Promise.all([cRes.json(), pRes.json(), hRes.json()]);
-        output.textContent = JSON.stringify({ health, ports, containers }, null, 2);
-      };
+      const containerSelect = document.getElementById('containerSelect');
+      let latestContainers = [];
+
+      function authHeaders(extra = {}) {
+        const token = document.getElementById('token').value.trim();
+        return token ? { ...extra, 'x-api-token': token } : extra;
+      }
+
+      async function api(path, init = {}) {
+        const headers = authHeaders(init.headers || {});
+        const res = await fetch(path, { ...init, headers });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `요청 실패: ${res.status}`);
+        return data;
+      }
+
+      function fillContainerSelect(items) {
+        latestContainers = items;
+        containerSelect.innerHTML = '';
+        if (!items.length) {
+          const op = document.createElement('option');
+          op.value = '';
+          op.textContent = '컨테이너 없음';
+          containerSelect.appendChild(op);
+          return;
+        }
+
+        for (const c of items) {
+          const op = document.createElement('option');
+          op.value = c.id;
+          op.textContent = `${c.name} (${c.state})`;
+          containerSelect.appendChild(op);
+        }
+      }
+
+      async function refresh() {
+        try {
+          const [containers, ports, health] = await Promise.all([
+            api('/api/containers'),
+            api('/api/ports'),
+            fetch('/api/health').then(r => r.json())
+          ]);
+          fillContainerSelect(containers.items || []);
+          output.textContent = JSON.stringify({ health, ports, containers }, null, 2);
+        } catch (e) {
+          output.textContent = `에러: ${e.message}`;
+        }
+      }
 
       document.getElementById('create').addEventListener('click', async () => {
         const body = {
@@ -48,14 +102,56 @@
         const hostPort = document.getElementById('hostPort').value.trim();
         if (hostPort) body.hostPort = Number(hostPort);
 
-        const res = await fetch('/api/containers', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body)
-        });
-        const data = await res.json();
-        alert(JSON.stringify(data));
-        await refresh();
+        try {
+          const data = await api('/api/containers', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body)
+          });
+          alert(JSON.stringify(data));
+          await refresh();
+        } catch (e) {
+          alert(e.message);
+        }
+      });
+
+      async function runAction(action, method = 'POST') {
+        const id = containerSelect.value;
+        if (!id) return alert('컨테이너를 선택하세요.');
+        try {
+          const data = await api(`/api/containers/${id}/${action}`, { method });
+          output.textContent = JSON.stringify(data, null, 2);
+          await refresh();
+        } catch (e) {
+          alert(e.message);
+        }
+      }
+
+      document.getElementById('start').addEventListener('click', () => runAction('start'));
+      document.getElementById('stop').addEventListener('click', () => runAction('stop'));
+      document.getElementById('restart').addEventListener('click', () => runAction('restart'));
+      document.getElementById('logs').addEventListener('click', async () => {
+        const id = containerSelect.value;
+        if (!id) return alert('컨테이너를 선택하세요.');
+        try {
+          const data = await api(`/api/containers/${id}/logs?tail=200`);
+          output.textContent = JSON.stringify(data, null, 2);
+        } catch (e) {
+          alert(e.message);
+        }
+      });
+
+      document.getElementById('remove').addEventListener('click', async () => {
+        const id = containerSelect.value;
+        if (!id) return alert('컨테이너를 선택하세요.');
+        if (!confirm('정말 삭제할까요?')) return;
+        try {
+          const data = await api(`/api/containers/${id}`, { method: 'DELETE' });
+          output.textContent = JSON.stringify(data, null, 2);
+          await refresh();
+        } catch (e) {
+          alert(e.message);
+        }
       });
 
       document.getElementById('refresh').addEventListener('click', refresh);

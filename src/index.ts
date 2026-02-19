@@ -12,6 +12,23 @@ type CreateContainerBody = {
 const MIN_PORT = 30000;
 const MAX_PORT = 39999;
 
+function getApiToken() {
+  return process.env.LAMYCLAW_API_TOKEN?.trim() || '';
+}
+
+function ensureAuthorized(request: Request) {
+  const configured = getApiToken();
+  if (!configured) return;
+
+  const headerToken = request.headers.get('x-api-token')?.trim() || '';
+  const auth = request.headers.get('authorization')?.trim() || '';
+  const bearer = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
+
+  if (headerToken !== configured && bearer !== configured) {
+    throw new Error('UNAUTHORIZED');
+  }
+}
+
 function run(command: string[], allowFail = false) {
   const proc = Bun.spawnSync(command, {
     stdout: 'pipe',
@@ -51,6 +68,9 @@ function getNextPort(preferred?: number): number {
   const used = getUsedPortsFromDocker();
 
   if (preferred) {
+    if (!Number.isInteger(preferred) || preferred < 1 || preferred > 65535) {
+      throw new Error(`요청 포트 ${preferred} 가 유효하지 않습니다.`);
+    }
     if (used.has(preferred)) throw new Error(`요청 포트 ${preferred} 는 이미 사용 중입니다.`);
     return preferred;
   }
@@ -105,12 +125,43 @@ function listContainers() {
 const app = new Elysia()
   .get('/', () => Bun.file('web/index.html'))
   .get('/api/health', () => ({ ok: true, service: 'lamyclaw', docker: dockerExists() }))
-  .get('/api/ports', () => ({
-    range: [MIN_PORT, MAX_PORT],
-    used: [...getUsedPortsFromDocker()].sort((a, b) => a - b)
-  }))
-  .get('/api/containers', () => ({ items: listContainers() }))
-  .post('/api/containers', ({ body, set }) => {
+  .get('/api/ports', ({ request, set }) => {
+    try {
+      ensureAuthorized(request);
+      return {
+        range: [MIN_PORT, MAX_PORT],
+        used: [...getUsedPortsFromDocker()].sort((a, b) => a - b)
+      };
+    } catch (error) {
+      if ((error as Error).message === 'UNAUTHORIZED') {
+        set.status = 401;
+        return { error: '인증 실패: x-api-token 또는 Authorization: Bearer 토큰이 필요합니다.' };
+      }
+      set.status = 400;
+      return { error: (error as Error).message };
+    }
+  })
+  .get('/api/containers', ({ request, set }) => {
+    try {
+      ensureAuthorized(request);
+      return { items: listContainers() };
+    } catch (error) {
+      if ((error as Error).message === 'UNAUTHORIZED') {
+        set.status = 401;
+        return { error: '인증 실패: x-api-token 또는 Authorization: Bearer 토큰이 필요합니다.' };
+      }
+      set.status = 400;
+      return { error: (error as Error).message };
+    }
+  })
+  .post('/api/containers', ({ body, request, set }) => {
+    try {
+      ensureAuthorized(request);
+    } catch (error) {
+      set.status = 401;
+      return { error: '인증 실패: x-api-token 또는 Authorization: Bearer 토큰이 필요합니다.' };
+    }
+
     const payload = body as CreateContainerBody;
     if (!payload?.name) {
       set.status = 400;
@@ -152,48 +203,74 @@ const app = new Elysia()
       return { error: (error as Error).message };
     }
   })
-  .post('/api/containers/:id/start', ({ params, set }) => {
+  .post('/api/containers/:id/start', ({ params, request, set }) => {
     try {
+      ensureAuthorized(request);
       run(['docker', 'start', params.id]);
       return { ok: true };
     } catch (error) {
+      if ((error as Error).message === 'UNAUTHORIZED') {
+        set.status = 401;
+        return { error: '인증 실패: x-api-token 또는 Authorization: Bearer 토큰이 필요합니다.' };
+      }
       set.status = 400;
       return { error: (error as Error).message };
     }
   })
-  .post('/api/containers/:id/stop', ({ params, set }) => {
+  .post('/api/containers/:id/stop', ({ params, request, set }) => {
     try {
+      ensureAuthorized(request);
       run(['docker', 'stop', params.id]);
       return { ok: true };
     } catch (error) {
+      if ((error as Error).message === 'UNAUTHORIZED') {
+        set.status = 401;
+        return { error: '인증 실패: x-api-token 또는 Authorization: Bearer 토큰이 필요합니다.' };
+      }
       set.status = 400;
       return { error: (error as Error).message };
     }
   })
-  .post('/api/containers/:id/restart', ({ params, set }) => {
+  .post('/api/containers/:id/restart', ({ params, request, set }) => {
     try {
+      ensureAuthorized(request);
       run(['docker', 'restart', params.id]);
       return { ok: true };
     } catch (error) {
+      if ((error as Error).message === 'UNAUTHORIZED') {
+        set.status = 401;
+        return { error: '인증 실패: x-api-token 또는 Authorization: Bearer 토큰이 필요합니다.' };
+      }
       set.status = 400;
       return { error: (error as Error).message };
     }
   })
-  .delete('/api/containers/:id', ({ params, set }) => {
+  .delete('/api/containers/:id', ({ params, request, set }) => {
     try {
+      ensureAuthorized(request);
       run(['docker', 'rm', '-f', params.id]);
       return { ok: true };
     } catch (error) {
+      if ((error as Error).message === 'UNAUTHORIZED') {
+        set.status = 401;
+        return { error: '인증 실패: x-api-token 또는 Authorization: Bearer 토큰이 필요합니다.' };
+      }
       set.status = 400;
       return { error: (error as Error).message };
     }
   })
-  .get('/api/containers/:id/logs', ({ params, query, set }) => {
+  .get('/api/containers/:id/logs', ({ params, query, request, set }) => {
     try {
-      const tail = String((query as Record<string, unknown>).tail ?? '200');
+      ensureAuthorized(request);
+      const tailRaw = Number((query as Record<string, unknown>).tail ?? 200);
+      const tail = Number.isFinite(tailRaw) && tailRaw > 0 ? String(Math.floor(tailRaw)) : '200';
       const { stdout } = run(['docker', 'logs', '--tail', tail, params.id], true);
       return { id: params.id, logs: stdout };
     } catch (error) {
+      if ((error as Error).message === 'UNAUTHORIZED') {
+        set.status = 401;
+        return { error: '인증 실패: x-api-token 또는 Authorization: Bearer 토큰이 필요합니다.' };
+      }
       set.status = 400;
       return { error: (error as Error).message };
     }

@@ -1,11 +1,20 @@
 import { Elysia } from 'elysia';
+import { existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 
 type CreateContainerBody = {
-  name: string;
+  name?: string;
+  project?: string;
+  owner?: string;
   image?: string;
   hostPort?: number;
   containerPort?: number;
+  workspaceHostPath?: string;
   env?: Record<string, string>;
+  labels?: Record<string, string>;
+  requiredDocs?: string[];
+  skillFiles?: string[];
+  workflowFiles?: string[];
   volumes?: Array<{ hostPath: string; containerPath: string; readOnly?: boolean }>;
 };
 
@@ -81,6 +90,62 @@ function getNextPort(preferred?: number): number {
   throw new Error('사용 가능한 포트가 없습니다.');
 }
 
+function normalizeNamePart(input: string) {
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 24);
+}
+
+function buildContainerMeta(payload: CreateContainerBody) {
+  const project = normalizeNamePart(payload.project || 'default');
+  const owner = normalizeNamePart(payload.owner || 'system');
+  const name = payload.name?.trim() || `${project}-${owner}-${Date.now()}`;
+
+  const labels: Record<string, string> = {
+    'com.lamyclaw.managed': 'true',
+    'com.lamyclaw.project': project,
+    'com.lamyclaw.owner': owner,
+    ...payload.labels
+  };
+
+  return { project, owner, name, labels };
+}
+
+function resolveWorkspaceHostPath(payload: CreateContainerBody, owner: string, project: string) {
+  const raw = payload.workspaceHostPath?.trim() || join('/tmp/lamyclaw-workspaces', owner, project);
+  mkdirSync(raw, { recursive: true });
+  return raw;
+}
+
+function verifyDocsInWorkspace(payload: CreateContainerBody, workspaceHostPath: string) {
+  const requiredDocs = payload.requiredDocs?.length
+    ? payload.requiredDocs
+    : ['AGENTS.md', 'RULE.md', 'PERSONA.md'];
+
+  const missing: string[] = [];
+  for (const file of requiredDocs) {
+    const p = join(workspaceHostPath, file);
+    if (!existsSync(p)) missing.push(file);
+  }
+
+  for (const file of payload.skillFiles || []) {
+    const p = join(workspaceHostPath, file);
+    if (!existsSync(p)) missing.push(file);
+  }
+
+  for (const file of payload.workflowFiles || []) {
+    const p = join(workspaceHostPath, file);
+    if (!existsSync(p)) missing.push(file);
+  }
+
+  if (missing.length) {
+    throw new Error(`워크스페이스 필수 문서 누락: ${missing.join(', ')}`);
+  }
+}
+
 function listContainers() {
   if (!dockerExists()) return [];
 
@@ -103,6 +168,7 @@ function listContainers() {
       Status: string;
       Ports: string;
       CreatedAt: string;
+      Labels?: string;
     };
 
     const hostPortMatch = row.Ports?.match(/:(\d+)->/);
@@ -115,6 +181,7 @@ function listContainers() {
       state: row.State,
       status: row.Status,
       ports: row.Ports,
+      labels: row.Labels || '',
       hostPort: hostPortMatch ? Number(hostPortMatch[1]) : null,
       containerPort: containerPortMatch ? Number(containerPortMatch[1]) : null,
       createdAt: row.CreatedAt
@@ -163,10 +230,6 @@ const app = new Elysia()
     }
 
     const payload = body as CreateContainerBody;
-    if (!payload?.name) {
-      set.status = 400;
-      return { error: 'name은 필수입니다.' };
-    }
 
     if (!dockerExists()) {
       set.status = 503;
@@ -174,11 +237,30 @@ const app = new Elysia()
     }
 
     try {
+      const { project, owner, name, labels } = buildContainerMeta(payload);
+      const workspaceHostPath = resolveWorkspaceHostPath(payload, owner, project);
+      verifyDocsInWorkspace(payload, workspaceHostPath);
+
       const hostPort = getNextPort(payload.hostPort);
       const containerPort = payload.containerPort ?? 3000;
-      const image = payload.image ?? 'opencode:latest';
+      const image = payload.image ?? 'ghcr.io/anomalyco/opencode:latest';
 
-      const args = ['docker', 'create', '--name', payload.name, '-p', `${hostPort}:${containerPort}`];
+      const args = [
+        'docker',
+        'create',
+        '--name',
+        name,
+        '-p',
+        `${hostPort}:${containerPort}`,
+        '-v',
+        `${workspaceHostPath}:/workspace`,
+        '--workdir',
+        '/workspace'
+      ];
+
+      for (const [k, v] of Object.entries(labels)) {
+        args.push('--label', `${k}=${v}`);
+      }
 
       if (payload.env) {
         for (const [k, v] of Object.entries(payload.env)) {
@@ -195,9 +277,36 @@ const app = new Elysia()
       args.push(image);
 
       const { stdout: id } = run(args);
-      run(['docker', 'start', id]);
+      try {
+        run(['docker', 'start', id]);
+        const requiredDocs = payload.requiredDocs?.length
+          ? payload.requiredDocs
+          : ['AGENTS.md', 'RULE.md', 'PERSONA.md'];
+        run([
+          'docker',
+          'exec',
+          id,
+          'sh',
+          '-lc',
+          requiredDocs.map((f) => `test -f /workspace/${f}`).join(' && ')
+        ]);
+      } catch (runtimeError) {
+        run(['docker', 'rm', '-f', id], true);
+        throw runtimeError;
+      }
 
-      return { ok: true, id, hostPort, containerPort };
+      return {
+        ok: true,
+        id,
+        name,
+        project,
+        owner,
+        labels,
+        workspaceHostPath,
+        workspaceContainerPath: '/workspace',
+        hostPort,
+        containerPort
+      };
     } catch (error) {
       set.status = 409;
       return { error: (error as Error).message };

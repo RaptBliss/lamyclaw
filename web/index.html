@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>lamyclaw</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem; }
+      .row { display: flex; gap: .5rem; margin-bottom: .75rem; flex-wrap: wrap; }
+      input, button { padding: .5rem .75rem; }
+      pre { background: #111; color: #0f0; padding: 1rem; min-height: 260px; overflow: auto; }
+    </style>
+  </head>
+  <body>
+    <h1>lamyclaw</h1>
+    <p>OpenCode Docker 컨테이너 관리</p>
+
+    <div class="row">
+      <input id="name" placeholder="컨테이너 이름" value="opencode-1" />
+      <input id="image" placeholder="이미지" value="opencode:latest" />
+      <input id="hostPort" placeholder="호스트 포트(선택)" />
+      <input id="containerPort" placeholder="컨테이너 포트" value="3000" />
+      <button id="create">컨테이너 생성</button>
+      <button id="refresh">목록 새로고침</button>
+    </div>
+
+    <pre id="output">loading...</pre>
+
+    <script>
+      const output = document.getElementById('output');
+      const refresh = async () => {
+        const [cRes, pRes, hRes] = await Promise.all([
+          fetch('/api/containers'),
+          fetch('/api/ports'),
+          fetch('/api/health')
+        ]);
+        const [containers, ports, health] = await Promise.all([cRes.json(), pRes.json(), hRes.json()]);
+        output.textContent = JSON.stringify({ health, ports, containers }, null, 2);
+      };
+
+      document.getElementById('create').addEventListener('click', async () => {
+        const body = {
+          name: document.getElementById('name').value,
+          image: document.getElementById('image').value,
+          containerPort: Number(document.getElementById('containerPort').value || 3000)
+        };
+
+        const hostPort = document.getElementById('hostPort').value.trim();
+        if (hostPort) body.hostPort = Number(hostPort);
+
+        const res = await fetch('/api/containers', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        alert(JSON.stringify(data));
+        await refresh();
+      });
+
+      document.getElementById('refresh').addEventListener('click', refresh);
+      refresh();
+    </script>
+  </body>
+</html>
